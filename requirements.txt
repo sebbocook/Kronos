@@ -8,3 +8,4 @@ tqdm==4.67.1
 safetensors==0.6.2
 fastapi
 uvicorn
+python-dotenv

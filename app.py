@@ -6,18 +6,23 @@ entgegennimmt und eine Kronos-Vorhersage als JSON zurückgibt.
 
 - Modell wird beim Start des Servers EINMAL geladen (bleibt danach im RAM),
   damit jeder API-Request sofort beantwortet wird.
+- load_dotenv() liest die .env-Datei im Pod (z. B. /home/instapod/app/.env)
+  explizit ein, damit in InstaPods gesetzte Umgebungsvariablen sicher
+  ankommen, unabhängig davon, wie der Start-Befehl aufgerufen wird.
 - Optionaler Schutz per API-Key: Wenn die Umgebungsvariable KRONOS_API_KEY
-  auf dem Pod gesetzt ist, muss jeder Request den Header
-  "X-API-Key: <derselbe Wert>" mitschicken. Ist die Variable nicht gesetzt,
-  ist der Endpunkt offen (nur für schnelle Tests empfohlen).
+  gesetzt ist, muss jeder Request den Header "X-API-Key: <derselbe Wert>"
+  mitschicken. Ist die Variable nicht gesetzt, ist der Endpunkt offen.
 """
 
 import os
 from contextlib import asynccontextmanager
 
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
+
+load_dotenv()  # liest .env im aktuellen Arbeitsverzeichnis ein, falls vorhanden
 
 # "model" ist der Ordner aus dem Kronos-Repo (model/ liegt neben dieser Datei)
 from model import Kronos, KronosTokenizer, KronosPredictor
@@ -37,6 +42,7 @@ async def lifespan(app: FastAPI):
     model = Kronos.from_pretrained(MODEL_NAME)
     state["predictor"] = KronosPredictor(model, tokenizer, device="cpu", max_context=MAX_CONTEXT)
     print(f"Kronos geladen: {MODEL_NAME} / {TOKENIZER_NAME}")
+    print(f"API-Key-Schutz aktiv: {API_KEY is not None}")
     yield
     state["predictor"] = None
 
@@ -67,7 +73,12 @@ class ForecastRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": state["predictor"] is not None, "model": MODEL_NAME}
+    return {
+        "status": "ok",
+        "model_loaded": state["predictor"] is not None,
+        "model": MODEL_NAME,
+        "api_key_protected": API_KEY is not None,
+    }
 
 
 @app.post("/forecast")

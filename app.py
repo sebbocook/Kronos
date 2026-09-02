@@ -20,9 +20,21 @@ damit man bei Problemen einfach zurückschalten kann, ohne Code zu ändern):
 Beide Optimierungen sind mit try/except abgesichert: schlägt eine fehl,
 läuft der Server einfach mit dem unveränderten Modell weiter (Log-Ausgabe
 zeigt das an), statt abzustürzen.
+
+Globale Warteschlange:
+- Ein einzelner Lock (max. 1 gleichzeitige Berechnung) sorgt dafür, dass
+  IMMER nur ein /forecast-Request gleichzeitig rechnet - egal ob der
+  Request von Telegram, dem Insider-Scan oder dem Test-Webhook kommt.
+  Weitere Requests warten automatisch, statt sich die CPU zu teilen und
+  sich gegenseitig zu verlangsamen (das war die Ursache des "hängt ewig"-
+  Vorfalls). KRONOS_QUEUE_TIMEOUT (Sekunden, Default 900 = 15 Min) begrenzt
+  die maximale Wartezeit in der Schlange, damit ein wirklich hängender
+  Request nicht alle nachfolgenden für immer blockiert.
 """
 
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -45,8 +57,12 @@ DEFAULT_NUM_PATHS = int(os.environ.get("KRONOS_NUM_PATHS", "25"))
 CPU_THREADS = int(os.environ.get("KRONOS_CPU_THREADS", "2"))
 USE_QUANTIZATION = os.environ.get("KRONOS_USE_QUANTIZATION", "true").lower() == "true"
 USE_COMPILE = os.environ.get("KRONOS_USE_COMPILE", "false").lower() == "true"
+QUEUE_TIMEOUT = int(os.environ.get("KRONOS_QUEUE_TIMEOUT", "900"))  # Sekunden, Default 15 Min
 
 torch.set_num_threads(CPU_THREADS)
+
+# Globaler Lock: erzwingt, dass immer nur EIN /forecast-Request gleichzeitig rechnet
+forecast_lock = threading.Lock()
 
 state = {"predictor": None, "quantization_active": False, "compile_active": False}
 
@@ -115,6 +131,7 @@ def health():
         "cpu_threads": CPU_THREADS,
         "quantization_active": state["quantization_active"],
         "compile_active": state["compile_active"],
+        "currently_computing": forecast_lock.locked(),
     }
 
 
@@ -139,6 +156,16 @@ def forecast(req: ForecastRequest, x_api_key: str | None = Header(default=None))
     if not has_volume:
         df = df.drop(columns=["volume"])
 
+    # Warteschlange: warten, bis kein anderer Request mehr rechnet (max. QUEUE_TIMEOUT Sekunden)
+    wait_start = time.time()
+    acquired = forecast_lock.acquire(timeout=QUEUE_TIMEOUT)
+    if not acquired:
+        raise HTTPException(
+            503,
+            f"Server ist seit über {QUEUE_TIMEOUT}s mit einer anderen Anfrage beschäftigt. Bitte später erneut versuchen.",
+        )
+    wait_seconds = round(time.time() - wait_start, 1)
+
     try:
         paths = []
         for _ in range(num_paths):
@@ -153,6 +180,8 @@ def forecast(req: ForecastRequest, x_api_key: str | None = Header(default=None))
             paths.append(pred_df)
     except Exception as e:
         raise HTTPException(500, f"Vorhersage fehlgeschlagen: {e}")
+    finally:
+        forecast_lock.release()
 
     forecast_out = []
     for i, ts in enumerate(req.future_timestamps):
@@ -178,7 +207,7 @@ def forecast(req: ForecastRequest, x_api_key: str | None = Header(default=None))
 
         forecast_out.append(entry)
 
-    return {"forecast": forecast_out, "paths_computed": num_paths}
+    return {"forecast": forecast_out, "paths_computed": num_paths, "queue_wait_seconds": wait_seconds}
 
 
 if __name__ == "__main__":

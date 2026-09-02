@@ -4,15 +4,22 @@ Kronos als Web-API für InstaPods.
 Stellt einen POST-Endpunkt /forecast bereit, der historische OHLC(V)-Daten
 entgegennimmt und eine Kronos-Vorhersage MIT Unsicherheitsbändern zurückgibt.
 
-- Modell wird beim Start des Servers EINMAL geladen (bleibt danach im RAM).
-- Statt eines einzelnen gemittelten Pfades werden NUM_PATHS unabhängige
-  Forecast-Läufe durchgeführt; pro future_timestamp werden Median sowie
-  10./90. Perzentil für open/high/low/close (und Median für volume)
-  zurückgegeben. Das macht die Unsicherheit über den Horizont hinweg
-  sichtbar - wichtig bei längeren Swing-Trade-Horizonten (z. B. 4 Wochen),
-  wo ein einzelner Punktwert am Ende der Prognose kaum belastbar wäre.
-- load_dotenv() liest die .env-Datei im Pod explizit ein.
-- Optionaler Schutz per API-Key über den Header "X-API-Key".
+Performance-Optimierungen (alle per Umgebungsvariable an/abschaltbar,
+damit man bei Problemen einfach zurückschalten kann, ohne Code zu ändern):
+- KRONOS_CPU_THREADS: explizite Thread-Anzahl für PyTorch (Default: 2,
+  passend zum InstaPods Build-Plan). Vermeidet, dass PyTorch im Container
+  eine falsche Kernanzahl errät.
+- KRONOS_USE_QUANTIZATION (Default: true): dynamische int8-Quantisierung
+  der Linear-Layer. Meist 20-40% schnellere Inferenz auf CPU, minimaler
+  Genauigkeitsverlust bei einem ohnehin kleinen Modell. Gilt als etablierte,
+  risikoarme Optimierung.
+- KRONOS_USE_COMPILE (Default: false): torch.compile() beim Start.
+  Kann zusätzlich beschleunigen, ist aber weniger vorhersagbar (kann bei
+  manchen Modellarchitekturen scheitern oder wirkungslos bleiben) - daher
+  standardmäßig aus, testweise aktivierbar.
+Beide Optimierungen sind mit try/except abgesichert: schlägt eine fehl,
+läuft der Server einfach mit dem unveränderten Modell weiter (Log-Ausgabe
+zeigt das an), statt abzustürzen.
 """
 
 import os
@@ -20,6 +27,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import pandas as pd
+import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -34,17 +42,40 @@ MAX_CONTEXT = int(os.environ.get("KRONOS_MAX_CONTEXT", "512"))
 API_KEY = os.environ.get("KRONOS_API_KEY")
 DEFAULT_NUM_PATHS = int(os.environ.get("KRONOS_NUM_PATHS", "25"))
 
-state = {"predictor": None}
+CPU_THREADS = int(os.environ.get("KRONOS_CPU_THREADS", "2"))
+USE_QUANTIZATION = os.environ.get("KRONOS_USE_QUANTIZATION", "true").lower() == "true"
+USE_COMPILE = os.environ.get("KRONOS_USE_COMPILE", "false").lower() == "true"
+
+torch.set_num_threads(CPU_THREADS)
+
+state = {"predictor": None, "quantization_active": False, "compile_active": False}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_NAME)
     model = Kronos.from_pretrained(MODEL_NAME)
+
+    if USE_QUANTIZATION:
+        try:
+            model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+            state["quantization_active"] = True
+            print("Dynamische Quantisierung aktiviert")
+        except Exception as e:
+            print(f"Quantisierung fehlgeschlagen, verwende Original-Modell: {e}")
+
+    if USE_COMPILE:
+        try:
+            model = torch.compile(model)
+            state["compile_active"] = True
+            print("torch.compile aktiviert")
+        except Exception as e:
+            print(f"torch.compile fehlgeschlagen, verwende unkompiliertes Modell: {e}")
+
     state["predictor"] = KronosPredictor(model, tokenizer, device="cpu", max_context=MAX_CONTEXT)
     print(f"Kronos geladen: {MODEL_NAME} / {TOKENIZER_NAME}")
     print(f"API-Key-Schutz aktiv: {API_KEY is not None}")
-    print(f"Standard-Pfadanzahl für Perzentil-Bänder: {DEFAULT_NUM_PATHS}")
+    print(f"CPU-Threads: {CPU_THREADS}, Quantisierung: {state['quantization_active']}, Compile: {state['compile_active']}")
     yield
     state["predictor"] = None
 
@@ -81,6 +112,9 @@ def health():
         "model": MODEL_NAME,
         "api_key_protected": API_KEY is not None,
         "default_num_paths": DEFAULT_NUM_PATHS,
+        "cpu_threads": CPU_THREADS,
+        "quantization_active": state["quantization_active"],
+        "compile_active": state["compile_active"],
     }
 
 
